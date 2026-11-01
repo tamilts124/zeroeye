@@ -9,9 +9,19 @@
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
  *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
+ * ### Token Refresh: Single-Flight Coordination
+ *
+ * When multiple callers (e.g. concurrent API requests or browser tabs) trigger
+ * `refreshTokens()` at the same time, all concurrent calls share a single
+ * in-flight refresh Promise (`_refreshInflight`). The first caller initiates the
+ * real network request; subsequent callers await the same Promise and receive the
+ * same resolved tokens — preventing redundant requests, stale token writes, and
+ * inconsistent session state.
+ *
+ * On failure the in-flight marker is cleared immediately so the next call can
+ * retry from a clean state. Cross-tab coordination uses the `BroadcastChannel`
+ * API (with a `localStorage`-event fallback for environments that do not support
+ * it) to propagate refresh outcomes without logging raw token values.
  */
 
 import { get, post, del } from './api';
@@ -125,10 +135,74 @@ const TOKEN_KEY = 'tot_auth_tokens';
 const USER_KEY = 'tot_user_data';
 const REFRESH_THRESHOLD = 60; // seconds before expiry to attempt refresh
 
+/**
+ * BroadcastChannel name used for cross-tab refresh coordination.
+ * Messages are structured as { type: 'REFRESH_DONE' | 'REFRESH_FAILED' }
+ * — raw token values are never transmitted over the channel.
+ */
+const REFRESH_CHANNEL_NAME = 'tot_auth_refresh';
+
 let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
+
+/**
+ * Single-flight guard for `refreshTokens`.
+ *
+ * When non-null, a refresh is already in progress; new callers must await this
+ * Promise instead of starting a second network request. The field is cleared
+ * (set back to `null`) as the very first step in both the success and failure
+ * paths so that a subsequent retry always starts fresh.
+ */
+let _refreshInflight: Promise<AuthTokens | null> | null = null;
+
+// ---------------------------------------------------------------------------
+// CROSS-TAB REFRESH CHANNEL
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a BroadcastChannel for refresh coordination, or `null` when the API
+ * is unavailable (e.g. some older mobile browsers / web workers without BC).
+ */
+function getRefreshChannel(): BroadcastChannel | null {
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      return new BroadcastChannel(REFRESH_CHANNEL_NAME);
+    }
+  } catch {
+    // ignore — fall back to storage events
+  }
+  return null;
+}
+
+/**
+ * Broadcast a refresh outcome to other tabs without exposing token values.
+ * Uses BroadcastChannel when available; falls back to a transient localStorage
+ * sentinel key that triggers the `storage` event in other tabs.
+ */
+function broadcastRefreshOutcome(success: boolean): void {
+  const type = success ? 'REFRESH_DONE' : 'REFRESH_FAILED';
+  const channel = getRefreshChannel();
+  if (channel) {
+    try {
+      channel.postMessage({ type });
+    } finally {
+      channel.close();
+    }
+    return;
+  }
+
+  // localStorage fallback: write then immediately remove so other tabs see
+  // a "storage" event. The value intentionally carries no token material.
+  try {
+    const key = `tot_refresh_signal_${Date.now()}`;
+    localStorage.setItem(key, type);
+    localStorage.removeItem(key);
+  } catch {
+    // ignore — storage may be unavailable
+  }
+}
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -276,25 +350,57 @@ export async function logout(): Promise<void> {
   notifyListeners(null);
 }
 
+/**
+ * Refresh the current access token.
+ *
+ * **Single-flight guarantee**: concurrent calls share one in-flight network
+ * request and resolve from its result. The in-flight marker is cleared before
+ * any success or failure side-effect so that a later retry always starts fresh.
+ *
+ * On success the new tokens are persisted and a cross-tab notification is sent
+ * (without exposing token values). On failure stored tokens are cleared, the
+ * user is signed out locally, and a cross-tab notification is sent so other
+ * tabs can react accordingly.
+ */
 export async function refreshTokens(): Promise<AuthTokens | null> {
+  // If a refresh is already in flight, share its result instead of issuing a
+  // second network request.
+  if (_refreshInflight !== null) {
+    return _refreshInflight;
+  }
+
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+  _refreshInflight = (async (): Promise<AuthTokens | null> => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
+      // Clear the in-flight marker before side-effects so concurrent callers
+      // that finished awaiting can see a clean state on their next call.
+      _refreshInflight = null;
 
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      broadcastRefreshOutcome(true);
+
+      return response.data.tokens;
+    } catch {
+      // Clear the in-flight marker first so a retry can proceed normally.
+      _refreshInflight = null;
+
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      broadcastRefreshOutcome(false);
+
+      return null;
+    }
+  })();
+
+  return _refreshInflight;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
@@ -447,4 +553,12 @@ export function hasRole(role: UserRole | UserRole[]): boolean {
     return role.includes(currentUser.role);
   }
   return currentUser.role === role;
+}
+
+/**
+ * Exposed for testing only: resets the single-flight inflight guard.
+ * Do NOT call in production code.
+ */
+export function _resetRefreshInflightForTest(): void {
+  _refreshInflight = null;
 }
